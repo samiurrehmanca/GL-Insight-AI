@@ -1,0 +1,1 @@
+GL Insight AI v3\n\nNew features:\n- upload ke baad hi analysis\n- custom mapping\n- better auto-mapping\n- automatic sample suggestion\n- per-head minimum 15% balance coverage target\n- cleaned sample Excel export\n\nRun:\n1. unzip\n2. cd gl_insight_streamlit_v3\n3. pip install -r requirements.txt\n4. streamlit run app.py\n\nBrowser: http://localhost:8501\n
