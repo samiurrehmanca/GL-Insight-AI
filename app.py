@@ -10,25 +10,6 @@ from gl_engine import (
     MONTH_ORDER,
 )
 
-def login():
-    st.title("🔐 Audit Tool Login")
-
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        if username == "auditor" and password == "auditorbdo@123":
-            st.session_state.authenticated = True
-            st.success("Login successful")
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
-
-# --- BLOCK APP IF NOT LOGGED IN ---
-if not st.session_state.authenticated:
-    login()
-    st.stop()
-
 st.set_page_config(page_title="GL Insight AI", layout="wide")
 
 if "df" not in st.session_state:
