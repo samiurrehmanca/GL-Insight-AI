@@ -10,6 +10,12 @@ from gl_engine import (
     MONTH_ORDER,
 )
 
+import streamlit as st
+
+# --- INIT SESSION SAFELY ---
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
+
 def login():
     st.title("🔐 Audit Tool Login")
 
@@ -18,14 +24,14 @@ def login():
 
     if st.button("Login"):
         if username == "auditor" and password == "auditorbdo@123":
-            st.session_state.authenticated = True
+            st.session_state["authenticated"] = True
             st.success("Login successful")
             st.rerun()
         else:
             st.error("Invalid credentials")
 
 # --- BLOCK APP IF NOT LOGGED IN ---
-if not st.session_state.authenticated:
+if not st.session_state.get("authenticated", False):
     login()
     st.stop()
     
