@@ -10,33 +10,10 @@ from gl_engine import (
     MONTH_ORDER,
 )
 
-import streamlit as st
-
-# --- INIT SESSION SAFELY ---
-if "authenticated" not in st.session_state:
-    st.session_state["authenticated"] = False
-
-def login():
-    st.title("🔐 Audit Tool Login")
-
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-
-    if st.button("Login"):
-        if username == "auditor" and password == "auditorbdo@123":
-            st.session_state["authenticated"] = True
-            st.success("Login successful")
-            st.rerun()
-        else:
-            st.error("Invalid credentials")
-
-# --- BLOCK APP IF NOT LOGGED IN ---
-if not st.session_state.get("authenticated", False):
-    login()
-    st.stop()
-    
 st.set_page_config(page_title="GL Insight AI", layout="wide")
 
+if "authenticated" not in st.session_state:
+    st.session_state["authenticated"] = False
 if "df" not in st.session_state:
     st.session_state.df = None
 if "filename" not in st.session_state:
@@ -47,6 +24,26 @@ if "uploaded_file_token" not in st.session_state:
     st.session_state.uploaded_file_token = None
 if "analysis_signature" not in st.session_state:
     st.session_state.analysis_signature = None
+
+def login():
+    st.title("🔐 Audit Tool Login")
+    st.caption("Enter your credentials to access the audit tool.")
+
+    with st.container(border=True):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        if st.button("Login", type="primary", use_container_width=True):
+            if username == "auditor" and password == "auditorbdo@123":
+                st.session_state["authenticated"] = True
+                st.success("Login successful")
+                st.rerun()
+            else:
+                st.error("Invalid credentials")
+
+
+if not st.session_state.get("authenticated", False):
+    login()
+    st.stop()
 
 st.title("GL Insight AI")
 st.caption("Improved GL analysis with exact source-row sampling, dynamic risk observations, assurance recommendations and HR analytics.")
@@ -128,6 +125,13 @@ def _run_analysis(df, mapping_override, fiscal_mode, manual_year_start):
     return result
 
 with st.sidebar:
+    st.header("Access")
+    if st.button("Logout", use_container_width=True):
+        st.session_state["authenticated"] = False
+        st.session_state.result = None
+        st.rerun()
+
+    st.divider()
     st.header("Upload GL")
     uploaded = st.file_uploader("Excel ya CSV upload karo", type=["xlsx", "xls", "csv"])
     if uploaded is not None:
@@ -243,13 +247,14 @@ with tab1:
         me = pd.DataFrame(result["monthly_entries"])
         if not me.empty:
             me = me.copy()
-            me["month"] = pd.Categorical(me["month"], categories=month_sequence, ordered=True)
-            me = me.sort_values("month")
-            me["month_label"] = me["month"].astype(str)
+            order_map = {m: i for i, m in enumerate(month_sequence)}
+            me["month_display"] = me["month"].astype(str)
+            me["month_order"] = me["month_display"].map(order_map)
+            me = me.sort_values("month_order")
             chart = alt.Chart(me).mark_bar().encode(
-                x=alt.X("month_label:N", sort=month_sequence, title="Month"),
+                x=alt.X("month_display:N", sort=alt.SortField(field="month_order", order="ascending"), title="Month"),
                 y=alt.Y("entries:Q", title="Entries"),
-                tooltip=["month_label", "entries"]
+                tooltip=[alt.Tooltip("month_display:N", title="Month"), alt.Tooltip("entries:Q", title="Entries")]
             )
             st.altair_chart(chart, use_container_width=True)
     with right:
@@ -257,15 +262,16 @@ with tab1:
         mv = pd.DataFrame(result["monthly_party_movement"])
         if not mv.empty:
             mv = mv.copy()
-            mv["month"] = pd.Categorical(mv["month"], categories=month_sequence, ordered=True)
-            mv = mv.sort_values("month")
-            mv["month_label"] = mv["month"].astype(str)
-            mv_long = mv.melt(id_vars=["month_label"], value_vars=["debit", "credit"], var_name="type", value_name="amount")
+            order_map = {m: i for i, m in enumerate(month_sequence)}
+            mv["month_display"] = mv["month"].astype(str)
+            mv["month_order"] = mv["month_display"].map(order_map)
+            mv = mv.sort_values("month_order")
+            mv_long = mv.melt(id_vars=["month_display", "month_order"], value_vars=["debit", "credit"], var_name="type", value_name="amount")
             chart = alt.Chart(mv_long).mark_line(point=True).encode(
-                x=alt.X("month_label:N", sort=month_sequence, title="Month"),
+                x=alt.X("month_display:N", sort=alt.SortField(field="month_order", order="ascending"), title="Month"),
                 y=alt.Y("amount:Q", title="Amount"),
                 color=alt.Color("type:N", title="Type"),
-                tooltip=["month_label", "type", "amount"]
+                tooltip=[alt.Tooltip("month_display:N", title="Month"), alt.Tooltip("type:N", title="Type"), alt.Tooltip("amount:Q", title="Amount", format=",.2f")]
             )
             st.altair_chart(chart, use_container_width=True)
     a, b = st.columns([1.8, 1])
@@ -275,7 +281,7 @@ with tab1:
             st.markdown(f"**{idx}.** {item}")
     with b:
         st.subheader("Risk distribution")
-        risk_df = pd.DataFrame(result["risk_distribution"]).rename(columns={"value": "no_of_entries"})
+        risk_df = pd.DataFrame(result["risk_distribution"]).rename(columns={"value": "No. of Entries"})
         st.dataframe(risk_df, use_container_width=True, hide_index=True)
 
 with tab2:
