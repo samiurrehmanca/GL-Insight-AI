@@ -1,3 +1,4 @@
+import altair as alt
 import pandas as pd
 import streamlit as st
 from gl_engine import (
@@ -6,13 +7,8 @@ from gl_engine import (
     export_samples_to_excel,
     export_assurance_to_excel,
     ALL_FIELDS,
+    MONTH_ORDER,
 )
-
-import streamlit as st
-
-# --- LOGIN STATE ---
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
 
 def login():
     st.title("🔐 Audit Tool Login")
@@ -43,9 +39,87 @@ if "result" not in st.session_state:
     st.session_state.result = None
 if "uploaded_file_token" not in st.session_state:
     st.session_state.uploaded_file_token = None
+if "analysis_signature" not in st.session_state:
+    st.session_state.analysis_signature = None
 
 st.title("GL Insight AI")
 st.caption("Improved GL analysis with exact source-row sampling, dynamic risk observations, assurance recommendations and HR analytics.")
+
+
+def _ordered_columns(df: pd.DataFrame) -> pd.DataFrame:
+    cols = list(df.columns)
+    priority_pairs = [
+        ("net_amount", "gross_amount"),
+        ("net_amount", "gross_sample_amount"),
+        ("net_amount", "gross_head_balance"),
+        ("net_head_balance", "gross_head_balance"),
+        ("net_amount", "gross_amount"),
+        ("net_amount", "gross_sample_amount"),
+        ("net_amount", "gross_head_balance"),
+        ("gross_head_balance", "coverage_pct_of_gross_head"),
+        ("signed_amount", "gross_amount"),
+        ("signed_amount", "gross_movement"),
+    ]
+    for left, right in priority_pairs:
+        if left in cols and right in cols and cols.index(left) > cols.index(right):
+            cols.remove(left)
+            insert_at = cols.index(right)
+            cols.insert(insert_at, left)
+    return df[cols]
+
+
+def _append_total_row(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out = _ordered_columns(out)
+    total_labels = [c for c in out.columns if out[c].dtype == object]
+    numeric_cols = out.select_dtypes(include="number").columns.tolist()
+    sum_keywords = ["amount", "balance", "movement", "entries", "count", "sample", "ticket"]
+    avg_keywords = ["pct", "rate", "cv", "share"]
+    total_row = {}
+    label_set = False
+    for col in out.columns:
+        col_norm = str(col).lower()
+        if not label_set and out[col].dtype == object:
+            total_row[col] = "TOTAL"
+            label_set = True
+        elif col in numeric_cols:
+            if any(k in col_norm for k in sum_keywords) and not any(k in col_norm for k in avg_keywords):
+                total_row[col] = round(float(pd.to_numeric(out[col], errors="coerce").fillna(0).sum()), 2)
+            else:
+                total_row[col] = None
+        else:
+            total_row[col] = None
+    return pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+
+
+def _show_df_with_totals(df: pd.DataFrame):
+    st.dataframe(_append_total_row(df), use_container_width=True, hide_index=True)
+
+
+def _analysis_signature(upload_token, mapping_override, fiscal_mode, manual_year_start):
+    clean_override = {k: (None if v == "__none__" else v) for k, v in mapping_override.items()}
+    return (
+        upload_token,
+        tuple((k, clean_override.get(k)) for k in sorted(clean_override)),
+        fiscal_mode,
+        int(manual_year_start) if fiscal_mode == "Manual" else None,
+    )
+
+
+def _run_analysis(df, mapping_override, fiscal_mode, manual_year_start):
+    clean_override = {k: (None if v == "__none__" else v) for k, v in mapping_override.items()}
+    result = analyze_gl(
+        df,
+        mapping_override=clean_override,
+        year_start_month=(manual_year_start if fiscal_mode == "Manual" else None),
+    )
+    st.session_state.result = result
+    st.session_state.analysis_signature = _analysis_signature(
+        st.session_state.uploaded_file_token, mapping_override, fiscal_mode, manual_year_start
+    )
+    return result
 
 with st.sidebar:
     st.header("Upload GL")
@@ -63,6 +137,23 @@ with st.sidebar:
             st.success(f"Loaded: {uploaded.name}")
         else:
             st.caption(f"Loaded: {st.session_state.filename}")
+
+    st.divider()
+    st.subheader("Monthly sequence")
+    month_options = list(range(1, 13))
+    fiscal_mode = st.radio(
+        "Year start mode",
+        options=["Auto detect", "Manual"],
+        horizontal=False,
+        help="Auto detect data ke earliest available month se sequence banata hai. Manual mode me aap khud fiscal year start month set kar sakte hain.",
+    )
+    manual_year_start = st.selectbox(
+        "Manual year start month",
+        options=month_options,
+        index=0,
+        format_func=lambda x: MONTH_ORDER[x - 1],
+        disabled=(fiscal_mode != "Manual"),
+    )
 
 
 df = st.session_state.df
@@ -92,10 +183,18 @@ with st.expander("Custom Mapping", expanded=True):
                 help=f"Auto confidence: {auto_conf.get(field, 0)}"
             )
 
+current_signature = _analysis_signature(st.session_state.uploaded_file_token, mapping_override, fiscal_mode, manual_year_start)
+
 if st.button("Run Analysis", type="primary", use_container_width=True):
-    clean_override = {k: (None if v == "__none__" else v) for k, v in mapping_override.items()}
     try:
-        st.session_state.result = analyze_gl(df, mapping_override=clean_override)
+        _run_analysis(df, mapping_override, fiscal_mode, manual_year_start)
+    except Exception as e:
+        st.error(f"Analysis error: {e}")
+
+elif st.session_state.result is not None and st.session_state.analysis_signature != current_signature:
+    try:
+        _run_analysis(df, mapping_override, fiscal_mode, manual_year_start)
+        st.info("Analysis auto-refreshed because mapping or monthly sequence settings changed.")
     except Exception as e:
         st.error(f"Analysis error: {e}")
 
@@ -105,6 +204,7 @@ if result is None:
     st.stop()
 
 st.success("Analysis completed.")
+st.caption(f"Monthly sequence: {result.get('year_start_month_name', 'Jan')} start ({result.get('year_start_mode', 'auto')})")
 if result.get("warnings"):
     for w in result["warnings"]:
         st.warning(w)
@@ -131,16 +231,37 @@ tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = tabs
 
 with tab1:
     left, right = st.columns(2)
+    month_sequence = result.get("month_sequence", MONTH_ORDER)
     with left:
         st.subheader("Monthly entries")
         me = pd.DataFrame(result["monthly_entries"])
         if not me.empty:
-            st.bar_chart(me.set_index("month"))
+            me = me.copy()
+            me["month"] = pd.Categorical(me["month"], categories=month_sequence, ordered=True)
+            me = me.sort_values("month")
+            me["month_label"] = me["month"].astype(str)
+            chart = alt.Chart(me).mark_bar().encode(
+                x=alt.X("month_label:N", sort=month_sequence, title="Month"),
+                y=alt.Y("entries:Q", title="Entries"),
+                tooltip=["month_label", "entries"]
+            )
+            st.altair_chart(chart, use_container_width=True)
     with right:
         st.subheader("Monthly debit / credit movement")
         mv = pd.DataFrame(result["monthly_party_movement"])
         if not mv.empty:
-            st.line_chart(mv.set_index("month"))
+            mv = mv.copy()
+            mv["month"] = pd.Categorical(mv["month"], categories=month_sequence, ordered=True)
+            mv = mv.sort_values("month")
+            mv["month_label"] = mv["month"].astype(str)
+            mv_long = mv.melt(id_vars=["month_label"], value_vars=["debit", "credit"], var_name="type", value_name="amount")
+            chart = alt.Chart(mv_long).mark_line(point=True).encode(
+                x=alt.X("month_label:N", sort=month_sequence, title="Month"),
+                y=alt.Y("amount:Q", title="Amount"),
+                color=alt.Color("type:N", title="Type"),
+                tooltip=["month_label", "type", "amount"]
+            )
+            st.altair_chart(chart, use_container_width=True)
     a, b = st.columns([1.8, 1])
     with a:
         st.subheader("Top observations")
@@ -148,7 +269,8 @@ with tab1:
             st.markdown(f"**{idx}.** {item}")
     with b:
         st.subheader("Risk distribution")
-        st.dataframe(pd.DataFrame(result["risk_distribution"]), use_container_width=True, hide_index=True)
+        risk_df = pd.DataFrame(result["risk_distribution"]).rename(columns={"value": "no_of_entries"})
+        st.dataframe(risk_df, use_container_width=True, hide_index=True)
 
 with tab2:
     st.subheader("Flagged journal explorer")
@@ -165,11 +287,11 @@ with tab2:
         if search:
             mask = filtered.astype(str).apply(lambda s: s.str.contains(search, case=False, na=False)).any(axis=1)
             filtered = filtered[mask]
-        st.dataframe(filtered, use_container_width=True, hide_index=True)
+        _show_df_with_totals(filtered)
 
 with tab3:
     st.subheader("Party-wise summary")
-    st.dataframe(pd.DataFrame(result["party_summary"]), use_container_width=True, hide_index=True)
+    _show_df_with_totals(pd.DataFrame(result["party_summary"]))
 
 with tab4:
     st.subheader("Automatic sampling")
@@ -180,13 +302,13 @@ with tab4:
 
     sample_summary_df = pd.DataFrame(result["sample_summary"])
     if not sample_summary_df.empty:
-        st.markdown("### Coverage by account head")
-        st.dataframe(sample_summary_df, use_container_width=True, hide_index=True)
+        st.markdown("### Coverage by account head (gross basis for sampling)")
+        _show_df_with_totals(sample_summary_df)
 
     sample_df = pd.DataFrame(result["sample_records"])
     if not sample_df.empty:
         st.markdown("### Suggested sample entries (with exact source row reference)")
-        st.dataframe(sample_df, use_container_width=True, hide_index=True)
+        _show_df_with_totals(sample_df)
 
         st.markdown("### Exact copied lines from uploaded GL")
         source_extract_df = pd.DataFrame(result["sample_source_extract"])
@@ -198,7 +320,7 @@ with tab4:
             result["sample_source_extract"],
         )
         st.download_button(
-            "Download Sample Excel (with Original GL Extract)",
+            "Download Sample Excel (with Net/Gross labels and Original GL Extract)",
             data=excel_bytes,
             file_name="gl_ai_sample_extract.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -209,7 +331,7 @@ with tab4:
     st.markdown("- Har account head ke liye at least 15% absolute balance coverage target liya gaya hai.")
     st.markdown("- High risk entries pehle include hoti hain.")
     st.markdown("- Phir medium risk aur zarurat par residual entries add hoti hain.")
-    st.markdown("- Ab har sample ke saath source row number aur original GL extract bhi diya jata hai, taa ke management se tie-back asaan ho.")
+    st.markdown("- Ab har sample ke saath source row number aur original GL extract bhi diya jata hai, taa ke management se tie-back asaan ho. Sampling coverage gross head basis par calculate hoti hai, is liye gross labels explicitly show kiye gaye hain.")
 
 with tab5:
     st.subheader("Assurance by head")
@@ -217,9 +339,9 @@ with tab5:
     assurance_df = pd.DataFrame(result["assurance_summary"])
     monthly_df = pd.DataFrame(result["assurance_monthly"])
     if not assurance_df.empty:
-        st.dataframe(assurance_df, use_container_width=True, hide_index=True)
+        _show_df_with_totals(assurance_df)
         with st.expander("Monthly analytical procedure output"):
-            st.dataframe(monthly_df, use_container_width=True, hide_index=True)
+            _show_df_with_totals(monthly_df)
         assurance_bytes = export_assurance_to_excel(
             result["assurance_summary"],
             result["assurance_monthly"],
@@ -242,9 +364,9 @@ with tab6:
     if hr_df.empty:
         st.info("Uploaded GL me clear HR-related heads detect nahi hue. Agar HR heads different naming se hain to account mapping / GL narration review karo.")
     else:
-        st.dataframe(hr_df, use_container_width=True, hide_index=True)
+        _show_df_with_totals(hr_df)
         with st.expander("HR monthly analytics applied on full selected account population"):
-            st.dataframe(hr_monthly_df, use_container_width=True, hide_index=True)
+            _show_df_with_totals(hr_monthly_df)
         assurance_bytes = export_assurance_to_excel(
             result["assurance_summary"],
             result["assurance_monthly"],
