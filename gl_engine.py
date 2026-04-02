@@ -200,10 +200,10 @@ def generate_samples(valid: pd.DataFrame, min_coverage: float = 0.15):
 
     for account, grp in df.groupby("account", dropna=False):
         grp = grp.sort_values(["risk_score", "amount_abs"], ascending=[False, False]).copy()
-        head_balance = float(grp["amount_abs"].sum())
-        if head_balance <= 0:
+        gross_head_balance = float(grp["amount_abs"].sum())
+        if gross_head_balance <= 0:
             continue
-        target = head_balance * min_coverage
+        target = gross_head_balance * min_coverage
 
         chosen = grp[grp["risk_label"] == "High"].copy()
         coverage = float(chosen["amount_abs"].sum()) if not chosen.empty else 0.0
@@ -228,25 +228,25 @@ def generate_samples(valid: pd.DataFrame, min_coverage: float = 0.15):
         if chosen.empty:
             continue
 
-        chosen["head_balance"] = head_balance
-        chosen["coverage_pct_of_head"] = chosen["amount_abs"].cumsum() / head_balance
+        chosen["gross_head_balance"] = gross_head_balance
+        chosen["coverage_pct_of_gross_head"] = chosen["amount_abs"].cumsum() / gross_head_balance
         sampled_parts.append(chosen)
 
         summaries.append({
             "account": str(account),
-            "head_balance": round(head_balance, 2),
+            "gross_head_balance": round(gross_head_balance, 2),
             "sample_count": int(len(chosen)),
             "sample_amount": round(float(chosen["amount_abs"].sum()), 2),
-            "coverage_pct": round(float(chosen["amount_abs"].sum()) / head_balance * 100, 1),
+            "coverage_pct": round(float(chosen["amount_abs"].sum()) / gross_head_balance * 100, 1),
         })
 
     if not sampled_parts:
         return pd.DataFrame(), []
 
     sample_df = pd.concat(sampled_parts).sort_values(["account", "risk_score", "amount_abs"], ascending=[True, False, False]).copy()
-    preview_cols = ["_source_row_num","journal_id","gl_date","account","party","user","Amount","amount_abs","risk_score","risk_label","sample_bucket","reasons","narration","head_balance","coverage_pct_of_head"]
+    preview_cols = ["_source_row_num","journal_id","gl_date","account","party","user","Amount","amount_abs","risk_score","risk_label","sample_bucket","reasons","narration","gross_head_balance","coverage_pct_of_gross_head"]
     sample_df = sample_df[preview_cols]
-    sample_df = sample_df.rename(columns={"gl_date": "date", "amount_abs": "sample_amount_abs", "_source_row_num": "source_row_num"})
+    sample_df = sample_df.rename(columns={"gl_date": "date", "Amount": "net_amount", "amount_abs": "gross_sample_amount", "_source_row_num": "source_row_num"})
     sample_df["date"] = sample_df["date"].dt.strftime("%Y-%m-%d")
     sample_df["reasons"] = sample_df["reasons"].apply(lambda x: ", ".join(list(x)) if isinstance(x, list) else str(x))
     return sample_df.reset_index(drop=True), summaries
@@ -264,6 +264,33 @@ def _cv(values: pd.Series) -> float:
 def _fmt_money(x: float) -> str:
     return f"{x:,.0f}"
 
+
+
+
+def _auto_year_start_month(valid: pd.DataFrame) -> int:
+    if valid.empty:
+        return 1
+    months_present = sorted(valid["gl_date"].dt.to_period("M").unique())
+    if not months_present:
+        return 1
+    first_period = months_present[0]
+    return int(first_period.month)
+
+
+def _month_sequence(year_start_month: int) -> List[str]:
+    idx = max(1, min(12, int(year_start_month))) - 1
+    return MONTH_ORDER[idx:] + MONTH_ORDER[:idx]
+
+
+def _sort_month_summary(df: pd.DataFrame, year_start_month: int, month_col: str = "month") -> pd.DataFrame:
+    if df.empty or month_col not in df.columns:
+        return df
+    sequence = _month_sequence(year_start_month)
+    order_map = {m: i for i, m in enumerate(sequence)}
+    out = df.copy()
+    out["_month_order"] = out[month_col].map(order_map).fillna(999)
+    out = out.sort_values(["_month_order", month_col]).drop(columns=["_month_order"])
+    return out
 
 def _period_range_strings(valid: pd.DataFrame) -> List[str]:
     if valid.empty:
@@ -382,7 +409,7 @@ def _dynamic_observations(valid: pd.DataFrame, month_counts: pd.Series, risk_dis
     if party_summary:
         top_party = party_summary[0]
         observations.append(
-            f"Counterparty concentration is led by {top_party['party']} with movement of {_fmt_money(float(top_party['amount']))}. Where this reflects recurring service or payroll-linked spend, assurance can be strengthened through expectation-based monthly analytics and contract-to-payment corroboration."
+            f"Counterparty concentration is led by {top_party['party']} with gross movement of {_fmt_money(float(top_party['gross_amount']))} and net movement of {_fmt_money(float(top_party['net_amount']))}. Where this reflects recurring service or payroll-linked spend, assurance can be strengthened through expectation-based monthly analytics and contract-to-payment corroboration."
         )
     if warnings:
         observations.append("Auto-mapping inferred some fields from the uploaded ledger. Before finalizing testing, management should agree the mapped columns and the exact source-row extract used for sample selection.")
@@ -396,9 +423,15 @@ def _build_assurance(valid: pd.DataFrame) -> Tuple[List[Dict], pd.DataFrame, Lis
 
     account_month = _build_complete_monthly(valid, "account")
     account_month = account_month.rename(columns={
-        "gross_movement": "abs_movement",
-        "prior_signed_amount": "prior_month_signed_amount",
+        "signed_amount": "net_amount",
+        "gross_movement": "gross_amount",
+        "prior_signed_amount": "prior_net_amount",
     })
+    account_month["abs_movement"] = account_month["gross_amount"]
+    account_month_export = account_month[[
+        "account", "period", "entries", "net_amount", "gross_amount", "unique_parties",
+        "avg_ticket", "prior_net_amount", "mom_change_pct", "weekend_entries", "month_end_entries", "manual_entries"
+    ]].copy()
 
     party_concentration = valid.groupby(["account", "party"])["amount_abs"].sum().reset_index()
     total_by_account = valid.groupby("account")["amount_abs"].sum().rename("total").reset_index()
@@ -452,8 +485,8 @@ def _build_assurance(valid: pd.DataFrame) -> Tuple[List[Dict], pd.DataFrame, Lis
 
         assurance_rows.append({
             "account": str(account),
-            "head_balance": round(float(row["head_balance"]), 2),
-            "gross_movement": round(float(row["gross_movement"]), 2),
+            "net_amount": round(float(row["head_balance"]), 2),
+            "gross_amount": round(float(row["gross_movement"]), 2),
             "entries": int(row["entries"]),
             "monthly_cv": round(float(row["monthly_cv"]), 2),
             "top_party_share_pct": round(float(row["top_party_share"] * 100), 1),
@@ -471,11 +504,11 @@ def _build_assurance(valid: pd.DataFrame) -> Tuple[List[Dict], pd.DataFrame, Lis
         hr_month = _build_complete_monthly(hr_df, "account")
         hr_month = hr_month.rename(columns={
             "signed_amount": "net_amount",
-            "gross_movement": "gross_movement",
+            "gross_movement": "gross_amount",
             "prior_signed_amount": "prior_net_amount",
         })
         hr_month = hr_month[[
-            "account", "period", "entries", "net_amount", "gross_movement", "unique_parties",
+            "account", "period", "entries", "net_amount", "gross_amount", "unique_parties",
             "avg_ticket", "prior_net_amount", "mom_change_pct", "weekend_entries", "month_end_entries", "manual_entries"
         ]]
 
@@ -502,8 +535,8 @@ def _build_assurance(valid: pd.DataFrame) -> Tuple[List[Dict], pd.DataFrame, Lis
                 apply = "Build a complete monthly roll-forward for the full account population, investigate spikes and dormant-month reactivations, analyze recurring parties, and corroborate abnormal months to HR or procurement evidence."
             hr_rows.append({
                 "account": str(account),
-                "net_movement": round(float(row["net_movement"]), 2),
-                "gross_movement": round(float(row["gross_movement"]), 2),
+                "net_amount": round(float(row["net_movement"]), 2),
+                "gross_amount": round(float(row["gross_movement"]), 2),
                 "entries": int(row["entries"]),
                 "unique_parties": int(row["unique_parties"]),
                 "manual_signal_pct": round(float(row["manual_rate"] * 100), 1),
@@ -514,31 +547,38 @@ def _build_assurance(valid: pd.DataFrame) -> Tuple[List[Dict], pd.DataFrame, Lis
             })
     else:
         hr_month = pd.DataFrame(columns=[
-            "account", "period", "entries", "net_amount", "gross_movement", "unique_parties",
+            "account", "period", "entries", "net_amount", "gross_amount", "unique_parties",
             "avg_ticket", "prior_net_amount", "mom_change_pct", "weekend_entries", "month_end_entries", "manual_entries"
         ])
 
-    return assurance_rows, account_month, hr_rows, hr_month
+    return assurance_rows, account_month_export, hr_rows, hr_month
 
 
-def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[str]]] = None):
+def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[str]]] = None, year_start_month: Optional[int] = None):
     work, mapping, confidence, warnings = normalize_gl(df, mapping_override)
     valid = work.dropna(subset=["gl_date"]).copy()
     if valid.empty:
         raise ValueError("Date parse nahi hui. Date format ya mapping check karo.")
 
     valid["period"] = valid["gl_date"].dt.to_period("M").astype(str)
+    if year_start_month is None:
+        year_start_month = _auto_year_start_month(valid)
+        year_start_mode = "auto"
+    else:
+        year_start_month = int(year_start_month)
+        year_start_mode = "manual"
+    month_sequence = _month_sequence(year_start_month)
     valid["month"] = valid["gl_date"].dt.strftime("%b")
     valid["day"] = valid["gl_date"].dt.day
     valid["weekday"] = valid["gl_date"].dt.day_name()
     valid["amount_abs"] = valid["Amount"].abs()
     valid["manual_signal"] = valid["narration"].astype(str).str.lower().apply(lambda x: any(k in x for k in MANUAL_KEYWORDS))
 
-    month_counts = valid.groupby("month").size().reindex(MONTH_ORDER, fill_value=0)
+    month_counts = valid.groupby("month").size().reindex(month_sequence, fill_value=0)
     avg_monthly = max(float(month_counts.mean()), 1.0)
     month_spike = month_counts / avg_monthly
 
-    party_month = valid.groupby(["party", "month"])["amount_abs"].sum().unstack(fill_value=0).reindex(columns=MONTH_ORDER, fill_value=0)
+    party_month = valid.groupby(["party", "month"])["amount_abs"].sum().unstack(fill_value=0).reindex(columns=month_sequence, fill_value=0)
     dormant_parties = set()
     for party, row in party_month.iterrows():
         arr = row.values
@@ -599,12 +639,12 @@ def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[s
     valid["reasons"] = valid.apply(reasons, axis=1)
     valid["sample_bucket"] = valid["risk_label"].map(lambda x: "100% High Risk" if x == "High" else ("Targeted Testing" if x == "Medium" else "Random Coverage"))
 
-    monthly_entries = [{"month": m, "entries": int(month_counts[m])} for m in MONTH_ORDER if month_counts[m] > 0]
+    monthly_entries = [{"month": m, "entries": int(month_counts[m])} for m in month_sequence if month_counts[m] > 0]
     movement_df = valid.groupby("month").agg(
         debit=("Amount", lambda s: float(s[s > 0].sum())),
         credit=("Amount", lambda s: float(abs(s[s < 0].sum())))
-    ).reindex(MONTH_ORDER, fill_value=0.0)
-    monthly_party_movement = [{"month": m, "debit": round(float(movement_df.loc[m, "debit"]), 2), "credit": round(float(movement_df.loc[m, "credit"]), 2)} for m in MONTH_ORDER if movement_df.loc[m].sum() > 0]
+    ).reindex(month_sequence, fill_value=0.0)
+    monthly_party_movement = [{"month": m, "debit": round(float(movement_df.loc[m, "debit"]), 2), "credit": round(float(movement_df.loc[m, "credit"]), 2)} for m in month_sequence if movement_df.loc[m].sum() > 0]
 
     risk_distribution = [
         {"name": "High", "value": int((valid["risk_label"] == "High").sum())},
@@ -612,17 +652,22 @@ def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[s
         {"name": "Low", "value": int((valid["risk_label"] == "Low").sum())},
     ]
 
-    party_summary_raw = valid.groupby("party").agg(entries=("journal_id", "count"), amount=("amount_abs", "sum"))
-    party_summary_raw["peak_month"] = valid.groupby(["party", "month"]).size().unstack(fill_value=0).reindex(columns=MONTH_ORDER, fill_value=0).idxmax(axis=1)
-    med = party_summary_raw["amount"].median() or 1.0
-    party_summary_raw["movement_pct"] = ((party_summary_raw["amount"] / med) - 1) * 100
+    party_summary_raw = valid.groupby("party").agg(
+        entries=("journal_id", "count"),
+        net_amount=("Amount", "sum"),
+        gross_amount=("amount_abs", "sum"),
+    )
+    party_summary_raw["peak_month"] = valid.groupby(["party", "month"]).size().unstack(fill_value=0).reindex(columns=month_sequence, fill_value=0).idxmax(axis=1)
+    med = party_summary_raw["gross_amount"].median() or 1.0
+    party_summary_raw["movement_pct"] = ((party_summary_raw["gross_amount"] / med) - 1) * 100
     party_summary_raw["risk_label"] = np.where(party_summary_raw["movement_pct"] > 100, "High", np.where(party_summary_raw["movement_pct"] > 30, "Medium", "Low"))
     party_summary = []
-    for party_name, row in party_summary_raw.sort_values("amount", ascending=False).head(10).iterrows():
+    for party_name, row in party_summary_raw.sort_values("gross_amount", ascending=False).iterrows():
         party_summary.append({
             "party": str(party_name),
             "entries": int(row["entries"]),
-            "amount": round(float(row["amount"]), 2),
+            "net_amount": round(float(row["net_amount"]), 2),
+            "gross_amount": round(float(row["gross_amount"]), 2),
             "peak_month": str(row["peak_month"]),
             "movement_pct": round(float(row["movement_pct"]), 1),
             "risk_label": str(row["risk_label"]),
@@ -638,7 +683,7 @@ def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[s
             "account": str(row["account"]),
             "party": str(row["party"]),
             "user": str(row["user"]),
-            "amount": round(float(row["Amount"]), 2),
+            "net_amount": round(float(row["Amount"]), 2),
             "risk_score": int(row["risk_score"]),
             "risk_label": str(row["risk_label"]),
             "reasons": ", ".join(list(row["reasons"])),
@@ -686,6 +731,10 @@ def analyze_gl(df: pd.DataFrame, mapping_override: Optional[Dict[str, Optional[s
         "assurance_monthly": assurance_monthly.to_dict(orient="records"),
         "hr_summary": hr_summary,
         "hr_monthly": hr_monthly.to_dict(orient="records"),
+        "year_start_month": int(year_start_month),
+        "year_start_month_name": MONTH_ORDER[int(year_start_month) - 1],
+        "year_start_mode": year_start_mode,
+        "month_sequence": month_sequence,
     }
 
 
@@ -709,14 +758,14 @@ def export_samples_to_excel(sample_records: List[Dict], sample_summary: List[Dic
     wb = Workbook()
     ws = wb.active
     ws.title = "Sample Details"
-    headers = ["Source Row","Journal ID","Date","Account","Party","User","Signed Amount","Absolute Amount","Risk Score","Risk Label","Sample Bucket","Reasons","Narration","Head Balance","Coverage % Running"]
+    headers = ["Source Row","Journal ID","Date","Account","Party","User","Net Amount","Gross Amount","Risk Score","Risk Label","Sample Bucket","Reasons","Narration","Gross Head Balance","Coverage % of Gross Head Running"]
     ws.append(headers)
     _style_header(ws, 1)
     for rec in sample_records:
         ws.append([
             rec.get("source_row_num"), rec.get("journal_id"), rec.get("date"), rec.get("account"), rec.get("party"), rec.get("user"),
-            rec.get("Amount", rec.get("amount")), rec.get("sample_amount_abs"), rec.get("risk_score"), rec.get("risk_label"),
-            rec.get("sample_bucket"), rec.get("reasons"), rec.get("narration"), rec.get("head_balance"), rec.get("coverage_pct_of_head")
+            rec.get("net_amount", rec.get("Amount", rec.get("amount"))), rec.get("gross_sample_amount", rec.get("sample_amount_abs")), rec.get("risk_score"), rec.get("risk_label"),
+            rec.get("sample_bucket"), rec.get("reasons"), rec.get("narration"), rec.get("gross_head_balance"), rec.get("coverage_pct_of_gross_head")
         ])
     for col in ["G","H","N"]:
         for cell in ws[col][1:]:
@@ -728,10 +777,10 @@ def export_samples_to_excel(sample_records: List[Dict], sample_summary: List[Dic
     ws.auto_filter.ref = ws.dimensions
 
     ws2 = wb.create_sheet("Coverage Summary")
-    ws2.append(["Account","Head Balance","Sample Count","Sample Amount","Coverage %"])
+    ws2.append(["Account","Gross Head Balance","Sample Count","Gross Sample Amount","Coverage % of Gross Head"])
     _style_header(ws2, 1)
     for rec in sample_summary:
-        ws2.append([rec.get("account"), rec.get("head_balance"), rec.get("sample_count"), rec.get("sample_amount"), rec.get("coverage_pct") / 100.0])
+        ws2.append([rec.get("account"), rec.get("gross_head_balance"), rec.get("sample_count"), rec.get("sample_amount"), rec.get("coverage_pct") / 100.0])
     for col in ["B","D"]:
         for cell in ws2[col][1:]:
             cell.number_format = '#,##0.00;[Red](#,##0.00)'
@@ -776,6 +825,8 @@ def export_assurance_to_excel(assurance_summary: List[Dict], assurance_monthly: 
             ws.append([rec.get(h) for h in hdr])
         ws.freeze_panes = "A2"
         ws.auto_filter.ref = ws.dimensions
+        total_row = len(assurance_summary) + 2
+        ws.append(["TOTAL", f"=SUM(B2:B{total_row-1})", f"=SUM(C2:C{total_row-1})", f"=SUM(D2:D{total_row-1})", "", "", f"=SUM(G2:G{total_row-1})", "", "", "", ""])
         for col in ["B", "C"]:
             for cell in ws[col][1:]:
                 cell.number_format = '#,##0.00;[Red](#,##0.00)'
@@ -795,11 +846,13 @@ def export_assurance_to_excel(assurance_summary: List[Dict], assurance_monthly: 
             ws2.append([rec.get(h) for h in hdr2])
         ws2.freeze_panes = "A2"
         ws2.auto_filter.ref = ws2.dimensions
-        _apply_widths(ws2, {"A":28,"B":12,"C":10,"D":16,"E":16,"F":16,"G":14,"H":16,"I":18,"J":16})
-        for col in ["D","E","F"]:
+        total_row2 = len(assurance_monthly) + 2
+        ws2.append(["TOTAL", "", f"=SUM(C2:C{total_row2-1})", f"=SUM(D2:D{total_row2-1})", f"=SUM(E2:E{total_row2-1})", f"=SUM(F2:F{total_row2-1})", f"=AVERAGE(G2:G{total_row2-1})", f"=SUM(H2:H{total_row2-1})", "", f"=SUM(J2:J{total_row2-1})", f"=SUM(K2:K{total_row2-1})", f"=SUM(L2:L{total_row2-1})"])
+        _apply_widths(ws2, {"A":28,"B":12,"C":10,"D":16,"E":16,"F":14,"G":14,"H":16,"I":14,"J":14,"K":16,"L":14})
+        for col in ["D","E","G","H"]:
             for cell in ws2[col][1:]:
                 cell.number_format = '#,##0.00;[Red](#,##0.00)'
-        for cell in ws2["J"][1:]:
+        for cell in ws2["I"][1:]:
             cell.number_format = '0.0%'
     else:
         ws2.append(["No monthly analytics available"])
@@ -813,7 +866,12 @@ def export_assurance_to_excel(assurance_summary: List[Dict], assurance_monthly: 
             ws3.append([rec.get(h) for h in hdr3])
         ws3.freeze_panes = "A2"
         ws3.auto_filter.ref = ws3.dimensions
-        _apply_widths(ws3, {"A":28,"B":16,"C":10,"D":12,"E":16,"F":32,"G":48,"H":58,"I":42})
+        total_row3 = len(hr_summary) + 2
+        ws3.append(["TOTAL", f"=SUM(B2:B{total_row3-1})", f"=SUM(C2:C{total_row3-1})", f"=SUM(D2:D{total_row3-1})", f"=SUM(E2:E{total_row3-1})", "", "", "", ""])
+        for col in ["B", "C"]:
+            for cell in ws3[col][1:]:
+                cell.number_format = '#,##0.00;[Red](#,##0.00)'
+        _apply_widths(ws3, {"A":28,"B":16,"C":16,"D":10,"E":12,"F":32,"G":48,"H":58,"I":42})
     else:
         ws3.append(["No HR-related heads detected from the uploaded GL."])
 
@@ -826,6 +884,8 @@ def export_assurance_to_excel(assurance_summary: List[Dict], assurance_monthly: 
             ws4.append([rec.get(h) for h in hdr4])
         ws4.freeze_panes = "A2"
         ws4.auto_filter.ref = ws4.dimensions
+        total_row4 = len(hr_monthly) + 2
+        ws4.append(["TOTAL", "", f"=SUM(C2:C{total_row4-1})", f"=SUM(D2:D{total_row4-1})", f"=SUM(E2:E{total_row4-1})", f"=SUM(F2:F{total_row4-1})", f"=AVERAGE(G2:G{total_row4-1})", f"=SUM(H2:H{total_row4-1})", "", f"=SUM(J2:J{total_row4-1})", f"=SUM(K2:K{total_row4-1})", f"=SUM(L2:L{total_row4-1})"])
         _apply_widths(ws4, {"A":28,"B":12,"C":10,"D":16,"E":16,"F":14,"G":14,"H":16,"I":14,"J":14,"K":16,"L":14})
         for col in ["D","E","G","H"]:
             for cell in ws4[col][1:]:
